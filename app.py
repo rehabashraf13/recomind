@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+import joblib
 import base64
 import html
 import io
@@ -619,36 +619,45 @@ class RetrievalEngine:
 
 
 @st.cache_resource(show_spinner=False)
-def build_engine(source_bytes: Optional[bytes], source_path: str) -> RetrievalEngine:
-    raw_df = read_source(source_bytes, source_path)
-    books = prepare_books(raw_df)
-    chunks = chunk_books(books)
+def build_engine() -> RetrievalEngine:
 
-    corpus = chunks["search_text"].astype(str).tolist()
-    tokenized_corpus = [tokenize_bm25(text) for text in corpus]
-    bm25 = BM25Okapi(tokenized_corpus)
+    artifacts_dir = APP_DIR / "artifacts"
 
-    embedder = SentenceTransformer(EMBEDDING_MODEL)
-    embeddings = embedder.encode(
-        corpus,
-        batch_size=256,
-        show_progress_bar=False,
-        normalize_embeddings=True,
+    books = pd.read_pickle(
+        artifacts_dir / "books.pkl"
     )
-    embeddings = np.asarray(embeddings, dtype="float32")
 
-    index = faiss.IndexFlatIP(embeddings.shape[1])
-    index.add(embeddings)
+    chunks = pd.read_pickle(
+        artifacts_dir / "chunks.pkl"
+    )
+
+    bm25 = joblib.load(
+        artifacts_dir / "bm25.joblib"
+    )
+
+    faiss_index = faiss.read_index(
+        str(artifacts_dir / "faiss.index")
+    )
+
+    # إنشاء IDs من ملف chunks بدل الحاجة إلى ملف منفصل
+    chunk_book_ids = (
+        chunks["book_id"]
+        .astype(np.int64)
+        .to_numpy()
+    )
+
+    embedder = SentenceTransformer(
+        EMBEDDING_MODEL
+    )
 
     return RetrievalEngine(
         books=books,
         chunks=chunks,
         bm25=bm25,
         embedder=embedder,
-        faiss_index=index,
-        chunk_book_ids=chunks["book_id"].astype(np.int64).to_numpy(),
+        faiss_index=faiss_index,
+        chunk_book_ids=chunk_book_ids,
     )
-
 
 @st.cache_resource(show_spinner=False)
 def load_reranker() -> CrossEncoder:
@@ -939,7 +948,7 @@ if source_bytes is None and not source_path:
 
 try:
     with st.spinner("Preparing the library and building the AI search index…"):
-        engine = build_engine(source_bytes, source_path)
+        engine = build_engine()
 except Exception as exc:
     st.error(f"Could not prepare the dataset: {exc}")
     st.stop()

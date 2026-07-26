@@ -1,0 +1,8 @@
+{
+  "fingerprint": "3fd4372126ba31dd23ba",
+  "embedding_model": "sentence-transformers/all-MiniLM-L6-v2",
+  "chunk_size": 150,
+  "overlap": 25,
+  "books": 64818,
+  "chunks": 93188
+}
