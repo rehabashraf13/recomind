@@ -580,11 +580,24 @@ class RetrievalEngine:
             [query], normalize_embeddings=True, show_progress_bar=False
         ).astype("float32")
 
-        semantic_sorted, semantic_indices = self.faiss_index.search(
-            q_vector, self.faiss_index.ntotal
-        )
-        semantic_chunk_scores = np.empty(self.faiss_index.ntotal, dtype=np.float32)
-        semantic_chunk_scores[semantic_indices[0]] = semantic_sorted[0]
+        search_k = min(300, self.faiss_index.ntotal)
+
+semantic_sorted, semantic_indices = self.faiss_index.search(
+    q_vector,
+    search_k
+)
+
+semantic_chunk_scores = np.full(
+    self.faiss_index.ntotal,
+    -np.inf,
+    dtype=np.float32
+)
+
+valid_indices = semantic_indices[0] >= 0
+
+semantic_chunk_scores[
+    semantic_indices[0][valid_indices]
+] = semantic_sorted[0][valid_indices]
 
         n_books = len(self.books)
         bm25_book = np.full(n_books, -np.inf, dtype=np.float32)
@@ -889,7 +902,7 @@ with st.sidebar:
     )
     use_reranker = st.toggle(
         "Advanced Cross-Encoder reranking",
-        value=True,
+        value=False,
         help="Improves final ordering, but the first search can be slower while the model loads.",
     )
 
