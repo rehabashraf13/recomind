@@ -1,6 +1,7 @@
 from __future__ import annotations
 import joblib
 import base64
+import gc
 import html
 import io
 import re
@@ -46,8 +47,6 @@ REQUIRED_COLUMNS = {"Title", "Authors", "Description", "Category"}
 REQUEST_HEADERS = {
     "User-Agent": "BrownLeafLibrary/1.0 (Streamlit book recommendation app)"
 }
-
-
 
 
 def image_file_to_data_uri(path: Path) -> str:
@@ -545,7 +544,6 @@ def read_source(source_bytes: Optional[bytes], source_path: str) -> pd.DataFrame
 @dataclass
 class RetrievalEngine:
     books: pd.DataFrame
-    chunks: pd.DataFrame
     bm25: BM25Okapi
     embedder: SentenceTransformer
     faiss_index: faiss.Index
@@ -557,9 +555,12 @@ class RetrievalEngine:
         output = np.zeros_like(values, dtype=np.float32)
         if not finite.any():
             return output
+
         minimum = values[finite].min()
         maximum = values[finite].max()
-        output[finite] = (values[finite] - minimum) / (maximum - minimum + 1e-9)
+        output[finite] = (
+            values[finite] - minimum
+        ) / (maximum - minimum + 1e-9)
         return output
 
     def search(
@@ -571,60 +572,110 @@ class RetrievalEngine:
     ) -> pd.DataFrame:
         query = query.strip()
         if not query:
-            return self.books.head(k).assign(score=0.0, semantic_score=0.0, bm25_score=0.0)
+            return self.books.head(k).assign(
+                score=0.0,
+                semantic_score=0.0,
+                bm25_score=0.0,
+            )
 
-        q_tokens = tokenize_bm25(query)
-        bm25_chunk_scores = np.asarray(self.bm25.get_scores(q_tokens), dtype=np.float32)
-
-                q_vector = self.embedder.encode(
+        q_vector = self.embedder.encode(
             [query],
             normalize_embeddings=True,
-            show_progress_bar=False
+            show_progress_bar=False,
         ).astype("float32")
 
-        search_k = min(300, self.faiss_index.ntotal)
-
-        semantic_sorted, semantic_indices = self.faiss_index.search(
+        # Search a limited number of dense candidates to keep CPU usage low
+        # on Streamlit Community Cloud.
+        search_k = min(500, self.faiss_index.ntotal)
+        semantic_scores, semantic_indices = self.faiss_index.search(
             q_vector,
-            search_k
+            search_k,
         )
 
-        semantic_chunk_scores = np.full(
-            self.faiss_index.ntotal,
-            -np.inf,
-            dtype=np.float32
-        )
+        candidate_indices = semantic_indices[0]
+        candidate_semantic_scores = semantic_scores[0]
+        valid = candidate_indices >= 0
+        candidate_indices = candidate_indices[valid]
+        candidate_semantic_scores = candidate_semantic_scores[valid]
 
-        valid_indices = semantic_indices[0] >= 0
+        if candidate_indices.size == 0:
+            return pd.DataFrame(
+                columns=list(self.books.columns) + ["score"]
+            )
 
-        semantic_chunk_scores[
-            semantic_indices[0][valid_indices]
-        ] = semantic_sorted[0][valid_indices]
+        q_tokens = tokenize_bm25(query)
 
+        # Score BM25 only for the FAISS candidates instead of every chunk.
+        # rank-bm25 0.2.2 provides get_batch_scores.
+        if hasattr(self.bm25, "get_batch_scores"):
+            candidate_bm25_scores = np.asarray(
+                self.bm25.get_batch_scores(
+                    q_tokens,
+                    candidate_indices.tolist(),
+                ),
+                dtype=np.float32,
+            )
+        else:
+            all_bm25_scores = np.asarray(
+                self.bm25.get_scores(q_tokens),
+                dtype=np.float32,
+            )
+            candidate_bm25_scores = all_bm25_scores[candidate_indices]
+
+        candidate_book_ids = self.chunk_book_ids[candidate_indices]
         n_books = len(self.books)
-        bm25_book = np.full(n_books, -np.inf, dtype=np.float32)
-        semantic_book = np.full(n_books, -np.inf, dtype=np.float32)
-        np.maximum.at(bm25_book, self.chunk_book_ids, bm25_chunk_scores)
-        np.maximum.at(semantic_book, self.chunk_book_ids, semantic_chunk_scores)
 
-        bm25_norm = self._minmax(bm25_book)
+        semantic_book = np.full(
+            n_books,
+            -np.inf,
+            dtype=np.float32,
+        )
+        bm25_book = np.full(
+            n_books,
+            -np.inf,
+            dtype=np.float32,
+        )
+
+        np.maximum.at(
+            semantic_book,
+            candidate_book_ids,
+            candidate_semantic_scores,
+        )
+        np.maximum.at(
+            bm25_book,
+            candidate_book_ids,
+            candidate_bm25_scores,
+        )
+
         semantic_norm = self._minmax(semantic_book)
+        bm25_norm = self._minmax(bm25_book)
         hybrid = alpha * semantic_norm + (1.0 - alpha) * bm25_norm
 
+        # Books that did not appear in the candidate chunks are excluded.
+        candidate_book_mask = np.zeros(n_books, dtype=bool)
+        candidate_book_mask[np.unique(candidate_book_ids)] = True
+        hybrid = np.where(candidate_book_mask, hybrid, -np.inf)
+
         if categories:
-            category_mask = self.books["Category"].isin(categories).to_numpy()
+            category_mask = (
+                self.books["Category"].isin(categories).to_numpy()
+            )
             hybrid = np.where(category_mask, hybrid, -np.inf)
 
         valid_count = int(np.isfinite(hybrid).sum())
         if valid_count == 0:
-            return pd.DataFrame(columns=list(self.books.columns) + ["score"])
+            return pd.DataFrame(
+                columns=list(self.books.columns) + ["score"]
+            )
 
         take = min(k, valid_count)
         if take == valid_count:
             top_ids = np.argsort(-hybrid)[:take]
         else:
             candidate_ids = np.argpartition(-hybrid, take - 1)[:take]
-            top_ids = candidate_ids[np.argsort(-hybrid[candidate_ids])]
+            top_ids = candidate_ids[
+                np.argsort(-hybrid[candidate_ids])
+            ]
 
         results = self.books.iloc[top_ids].copy()
         results["score"] = hybrid[top_ids]
@@ -633,50 +684,92 @@ class RetrievalEngine:
         return results.reset_index(drop=True)
 
 
+def find_artifacts_dir() -> Path:
+    artifacts_root = APP_DIR / "artifacts"
+    required_files = {
+        "books.pkl",
+        "chunks.pkl",
+        "bm25.joblib",
+        "faiss.index",
+    }
+
+    candidates = [
+        artifacts_root / "3fd4372126ba31dd23ba",
+        artifacts_root,
+    ]
+
+    if artifacts_root.exists():
+        candidates.extend(
+            path
+            for path in artifacts_root.iterdir()
+            if path.is_dir()
+        )
+
+    for candidate in candidates:
+        if all((candidate / name).exists() for name in required_files):
+            return candidate
+
+    checked_paths = "\n".join(str(path) for path in candidates)
+    raise FileNotFoundError(
+        "RAG artifact files were not found. Checked:\n"
+        f"{checked_paths}"
+    )
+
+
 @st.cache_resource(show_spinner=False)
 def build_engine() -> RetrievalEngine:
+    artifacts_dir = find_artifacts_dir()
 
-   artifacts_dir = (
-    APP_DIR
-    / "artifacts"
-    / "3fd4372126ba31dd23ba"
-)
-
-    books = pd.read_pickle(
-        artifacts_dir / "books.pkl"
-    )
-
-    chunks = pd.read_pickle(
-        artifacts_dir / "chunks.pkl"
-    )
-
-    bm25 = joblib.load(
-        artifacts_dir / "bm25.joblib"
-    )
-
+    books = pd.read_pickle(artifacts_dir / "books.pkl")
+    chunks = pd.read_pickle(artifacts_dir / "chunks.pkl")
+    bm25 = joblib.load(artifacts_dir / "bm25.joblib")
     faiss_index = faiss.read_index(
         str(artifacts_dir / "faiss.index")
     )
 
-    # إنشاء IDs من ملف chunks بدل الحاجة إلى ملف منفصل
+    if "book_id" not in chunks.columns:
+        raise ValueError(
+            "chunks.pkl must contain a 'book_id' column."
+        )
+
     chunk_book_ids = (
         chunks["book_id"]
         .astype(np.int64)
-        .to_numpy()
+        .to_numpy(copy=True)
     )
 
+    if faiss_index.ntotal != len(chunk_book_ids):
+        raise ValueError(
+            "FAISS index size does not match chunks.pkl: "
+            f"{faiss_index.ntotal} vectors vs "
+            f"{len(chunk_book_ids)} chunk IDs."
+        )
+
+    if chunk_book_ids.size and (
+        chunk_book_ids.min() < 0
+        or chunk_book_ids.max() >= len(books)
+    ):
+        raise ValueError(
+            "chunks.pkl contains book_id values outside books.pkl."
+        )
+
+    # The complete chunks DataFrame is not needed after extracting IDs.
+    del chunks
+    gc.collect()
+
     embedder = SentenceTransformer(
-        EMBEDDING_MODEL
+        EMBEDDING_MODEL,
+        device="cpu",
     )
 
     return RetrievalEngine(
         books=books,
-        chunks=chunks,
         bm25=bm25,
         embedder=embedder,
         faiss_index=faiss_index,
         chunk_book_ids=chunk_book_ids,
     )
+
 
 @st.cache_resource(show_spinner=False)
 def load_reranker() -> CrossEncoder:
@@ -948,25 +1041,8 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-source_bytes: Optional[bytes] = uploaded_file.getvalue() if uploaded_file else None
-default_dataset = find_default_dataset()
-source_path = str(default_dataset) if default_dataset else ""
-
-if source_bytes is None and not source_path:
-    st.markdown(
-        """
-        <div class="empty-state">
-            <h3>📂 Add your book catalog</h3>
-            <p>Place <strong>BooksDataset.csv</strong> beside <code>app.py</code> to load your catalog automatically.</p>
-            <p>Required columns: Title, Authors, Description, Category.</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    st.stop()
-
 try:
-    with st.spinner("Preparing the library and building the AI search index…"):
+    with st.spinner("Loading the library search engine…"):
         engine = build_engine()
 except Exception as exc:
     st.error(f"Could not prepare the dataset: {exc}")
