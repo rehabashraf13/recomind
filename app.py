@@ -576,11 +576,13 @@ class RetrievalEngine:
         q_tokens = tokenize_bm25(query)
         bm25_chunk_scores = np.asarray(self.bm25.get_scores(q_tokens), dtype=np.float32)
 
-        q_vector = self.embedder.encode(
-            [query], normalize_embeddings=True, show_progress_bar=False
+                q_vector = self.embedder.encode(
+            [query],
+            normalize_embeddings=True,
+            show_progress_bar=False
         ).astype("float32")
 
-                search_k = min(300, self.faiss_index.ntotal)
+        search_k = min(300, self.faiss_index.ntotal)
 
         semantic_sorted, semantic_indices = self.faiss_index.search(
             q_vector,
