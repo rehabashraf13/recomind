@@ -621,7 +621,11 @@ class RetrievalEngine:
 @st.cache_resource(show_spinner=False)
 def build_engine() -> RetrievalEngine:
 
-    artifacts_dir = APP_DIR / "artifacts"
+   artifacts_dir = (
+    APP_DIR
+    / "artifacts"
+    / "3fd4372126ba31dd23ba"
+)
 
     books = pd.read_pickle(
         artifacts_dir / "books.pkl"
