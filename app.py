@@ -580,24 +580,24 @@ class RetrievalEngine:
             [query], normalize_embeddings=True, show_progress_bar=False
         ).astype("float32")
 
-        search_k = min(300, self.faiss_index.ntotal)
+                search_k = min(300, self.faiss_index.ntotal)
 
-semantic_sorted, semantic_indices = self.faiss_index.search(
-    q_vector,
-    search_k
-)
+        semantic_sorted, semantic_indices = self.faiss_index.search(
+            q_vector,
+            search_k
+        )
 
-semantic_chunk_scores = np.full(
-    self.faiss_index.ntotal,
-    -np.inf,
-    dtype=np.float32
-)
+        semantic_chunk_scores = np.full(
+            self.faiss_index.ntotal,
+            -np.inf,
+            dtype=np.float32
+        )
 
-valid_indices = semantic_indices[0] >= 0
+        valid_indices = semantic_indices[0] >= 0
 
-semantic_chunk_scores[
-    semantic_indices[0][valid_indices]
-] = semantic_sorted[0][valid_indices]
+        semantic_chunk_scores[
+            semantic_indices[0][valid_indices]
+        ] = semantic_sorted[0][valid_indices]
 
         n_books = len(self.books)
         bm25_book = np.full(n_books, -np.inf, dtype=np.float32)
